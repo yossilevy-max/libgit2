@@ -1382,3 +1382,17 @@ bool git_str_gather_text_stats(
 	return (stats->cr != stats->crlf || stats->nul > 0 ||
 		((stats->printable >> 7) < stats->nonprintable));
 }
+
+/* strig demo: deliberate defects, do not merge */
+int git_str__strig_demo(int x)
+{
+    char buf[8];
+    int *p = NULL;
+    int i;
+
+    for (i = 0; i <= 8; i++)
+        buf[i] = 'a';
+    if (x > 0)
+        p = &x;
+    return buf[0] + *p;
+}
