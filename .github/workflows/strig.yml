@@ -9,6 +9,8 @@ jobs:
   build:
     runs-on: [self-hosted, strig]
     timeout-minutes: 75
+    env:
+      STRIG_NO_LICENSE: "1"  # the demo builder runs a dev build of strig (no TPM, no licence), like its login profile
     steps:
       - uses: actions/checkout@v4
       - name: Build under strig
