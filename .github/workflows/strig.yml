@@ -1,0 +1,61 @@
+# Strig demo (Y7.2 / Y7.8): build under strig on the self-hosted demo builder, then ask the backend
+# for this commit's gate verdict. The "Strig gate" step is the demo's GitHub Actions snippet, unchanged.
+name: strig
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: [self-hosted, strig]
+    timeout-minutes: 75
+    env:
+      STRIG_NO_LICENSE: "1"  # the demo builder runs a dev build of strig (no TPM, no licence), like its login profile
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build under strig
+        run: |
+          date -u +%Y-%m-%dT%H:%M:%SZ > "$RUNNER_TEMP/strig-started"
+          cmake -S . -B build -DBUILD_TESTS=OFF -DBUILD_CLI=ON
+          strig cmake --build build -j4
+      # Not part of the snippet: the demo builder's analysis takes 11-25 min, longer than the snippet's
+      # own wait (3 x 120 s), so wait here for this build's analysis to finish first.
+      # `strig jobs --json` prints the banner before the JSON, hence the sed.
+      - name: Wait for the analysis
+        run: |
+          since=$(cat "$RUNNER_TEMP/strig-started")
+          for i in $(seq 1 120); do
+            state=$(strig jobs --json 2>/dev/null | sed -n '/^\[/,$p' \
+              | jq -r --arg s "$since" '[.[] | select(.build_started_at >= $s)] | sort_by(.build_started_at) | last | .state // "none"')
+            echo "analysis: $state"
+            case "$state" in completed|failed|error|cancelled) exit 0 ;; esac
+            sleep 30
+          done
+          echo "analysis did not finish in 60 min" >&2; exit 2
+      - name: Strig gate
+        env:
+          STRIG_BACKEND_TOKEN: ${{ secrets.STRIG_BACKEND_TOKEN }}
+          COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          GATE="https://strig-vps.tail979723.ts.net/api/v1/tenants/01a11a42-a41d-7655-b3b7-6f68d21d55ef/projects/01a11a51-d54b-7fce-b569-765978961d45/gate"
+          tmp=$(mktemp); hdr=$(mktemp); trap 'rm -f "$tmp" "$hdr"' EXIT
+          for attempt in 1 2 3; do  # each request waits up to 120 s for the run to arrive
+            code=$(printf 'header = "Authorization: Bearer %s"\n' "$STRIG_BACKEND_TOKEN" | curl -sSg --max-time 135 --config - -o "$tmp" -D "$hdr" -w '%{http_code}' "$GATE?commit=$COMMIT&wait=120") || { echo "strig gate: request failed" >&2; exit 3; }
+            if [ "$code" = 503 ]; then  # too many waiters: honour Retry-After (at most 60 s), then ask again
+              delay=$(awk 'tolower($1)=="retry-after:"{d=$2+0} END{print d+0}' "$hdr")
+              [ "$delay" -ge 1 ] || delay=5; [ "$delay" -le 60 ] || delay=60
+              sleep "$delay"; continue
+            fi
+            [ "$code" = 200 ] || { echo "strig gate: request failed (HTTP $code)" >&2; exit 3; }
+            body=$(cat "$tmp")
+            verdict=$(printf "%s" "$body" | jq -r .verdict) || { echo "strig gate: unreadable verdict" >&2; exit 3; }
+            mode=$(printf "%s" "$body" | jq -r "(.mode.mode? // empty)" 2>/dev/null) || mode=""  # missing or unparseable: treated as enforce
+            case "$verdict" in
+              PASS) echo "strig gate: PASS"; exit 0 ;;
+              FAIL) echo "strig gate: FAIL ($mode) $(printf "%s" "$body" | jq -r '.url // empty')"; case "$mode" in warn|off) exit 0 ;; *) exit 1 ;; esac ;;
+              PENDING|NO_RUN) ;;  # ask again
+              *) echo "strig gate: unreadable verdict" >&2; exit 3 ;;
+            esac
+          done
+          [ "$code" = 503 ] && { echo "strig gate: server busy" >&2; exit 3; }
+          echo "strig gate: no verdict yet" >&2; exit 2
